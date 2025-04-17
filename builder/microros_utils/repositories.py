@@ -1,8 +1,21 @@
-import os, sys
+import os
+import sys
 import json
 import xml.etree.ElementTree as xml_parser
+import time
+import requests
+import geoip2.database
 
 from .utils import run_cmd
+
+def get_country_code():
+    try:
+        response = requests.get('https://ipinfo.io')
+        data = response.json()
+        return data['country']
+    except Exception as e:
+        print(f"Error fetching IP info: {e}")
+        return None
 
 class Package:
     def __init__(self, name, path):
@@ -25,13 +38,30 @@ class Repository:
         self.path = None
 
     def clone(self, folder):
-        self.path = folder + "\\" + self.name
-        # TODO(pablogs) ensure that git is installed
+        self.path = os.path.join(folder, self.name)
+        attempts = 0
+        # Download reconnect time, 1s by default
+        retry_delay = 1
+        # The number of repository redownloads that fail is defined here
+        max_attempts = 10
+
         command = "git clone -b {} {} {}".format(self.branch, self.url, self.path)
         result, stderr = run_cmd(command, capture_output=True)
 
-        if 0 != result:
-            print("{} clone failed: {}\n".format(self.name, stderr))
+        if result == 0:
+            # Download successfully, exit the loop
+            return
+        else:
+            while attempts < max_attempts:
+                attempts += 1
+                print("{} clone failed! Retrying...".format(self.name))
+                command = "git clone -b {} {} {}".format(self.branch, self.url, self.path)
+                result, stderr = run_cmd(command, capture_output=True)
+                # Wait a while and try again
+                time.sleep(retry_delay)
+
+            # If all attempts fail, print an error message and exit the script
+            print("Max attempts reached. Failed to clone {} after {} attempts.".format(self.name, max_attempts))
             sys.exit(1)
 
     def get_packages(self):
@@ -68,68 +98,77 @@ class Repository:
             return None
 
 class Sources:
+    country_code = get_country_code()
+
+    if country_code == 'CN':
+        micro_ros_mirror_prefix = "https://gitee.com/rtt-microros-mirror"
+        print("=========================== Use Chinese mirror source for download ==============================")
+    else:
+        micro_ros_mirror_prefix = "https://github.com/RT-MicroROS"
+        print("=========================== Download using the Github source ==============================")
+
     dev_environments = {
          'humble': [
-            Repository("ament_cmake", "https://github.com/ament/ament_cmake", "humble"),
-            Repository("ament_lint", "https://github.com/ament/ament_lint", "humble"),
-            Repository("ament_package", "https://github.com/ament/ament_package", "humble"),
-            Repository("googletest", "https://github.com/ament/googletest", "humble"),
-            Repository("ament_cmake_ros", "https://github.com/ros2/ament_cmake_ros", "humble"),
-            Repository("ament_index", "https://github.com/ament/ament_index", "humble")
+            Repository("ament_cmake", micro_ros_mirror_prefix + "/ament_cmake", "humble"),
+            Repository("ament_lint", micro_ros_mirror_prefix + "/ament_lint", "humble"),
+            Repository("ament_package", micro_ros_mirror_prefix + "/ament_package", "humble"),
+            Repository("googletest", micro_ros_mirror_prefix + "/googletest", "humble"),
+            Repository("ament_cmake_ros", micro_ros_mirror_prefix +"/ament_cmake_ros", "humble"),
+            Repository("ament_index", micro_ros_mirror_prefix + "/ament_index", "humble")
         ],
         'foxy': [
-            Repository("ament_cmake", "https://github.com/ament/ament_cmake", "foxy"),
-            Repository("ament_lint", "https://github.com/ament/ament_lint", "foxy"),
-            Repository("ament_package", "https://github.com/ament/ament_package", "foxy"),
-            Repository("googletest", "https://github.com/ament/googletest", "foxy"),
-            Repository("ament_cmake_ros", "https://github.com/ros2/ament_cmake_ros", "foxy"),
-            Repository("ament_index", "https://github.com/ament/ament_index", "foxy")
+            Repository("ament_cmake", micro_ros_mirror_prefix + "/ament_cmake", "foxy"),
+            Repository("ament_lint", micro_ros_mirror_prefix + "/ament_lint", "foxy"),
+            Repository("ament_package", micro_ros_mirror_prefix + "/ament_package", "foxy"),
+            Repository("googletest", micro_ros_mirror_prefix + "/googletest", "foxy"),
+            Repository("ament_cmake_ros", micro_ros_mirror_prefix +"/ament_cmake_ros", "foxy"),
+            Repository("ament_index", micro_ros_mirror_prefix + "/ament_index", "foxy")
         ]
     }
 
     mcu_environments = {
         'humble': [
-            Repository("micro-CDR", "https://github.com/eProsima/micro-CDR", "humble", "ros2"),
-            Repository("Micro-XRCE-DDS-Client", "https://github.com/eProsima/Micro-XRCE-DDS-Client", "humble", "ros2"),
-            Repository("rcl", "https://github.com/micro-ROS/rcl", "humble"),
-            Repository("rclc", "https://github.com/ros2/rclc", "humble"),
-            Repository("micro_ros_utilities", "https://github.com/micro-ROS/micro_ros_utilities", "humble"),
-            Repository("rcutils", "https://github.com/micro-ROS/rcutils", "humble"),
-            Repository("micro_ros_msgs", "https://github.com/micro-ROS/micro_ros_msgs", "humble"),
-            Repository("rmw-microxrcedds", "https://github.com/micro-ROS/rmw-microxrcedds", "humble"),
-            Repository("rosidl_typesupport", "https://github.com/micro-ROS/rosidl_typesupport", "humble"),
-            Repository("rosidl_typesupport_microxrcedds", "https://github.com/micro-ROS/rosidl_typesupport_microxrcedds", "humble"),
-            Repository("rosidl", "https://github.com/ros2/rosidl", "humble"),
-            Repository("rmw", "https://github.com/ros2/rmw", "humble"),
-            Repository("rcl_interfaces", "https://github.com/ros2/rcl_interfaces", "humble"),
-            Repository("rosidl_defaults", "https://github.com/ros2/rosidl_defaults", "humble"),
-            Repository("unique_identifier_msgs", "https://github.com/ros2/unique_identifier_msgs", "humble"),
-            Repository("common_interfaces", "https://github.com/ros2/common_interfaces", "humble"),
-            Repository("test_interface_files", "https://github.com/ros2/test_interface_files", "humble"),
-            Repository("rmw_implementation", "https://github.com/ros2/rmw_implementation", "humble"),
-            Repository("rcl_logging", "https://github.com/ros2/rcl_logging", "humble"),
-            Repository("ros2_tracing", "https://gitlab.com/micro-ROS/ros_tracing/ros2_tracing", "humble"),
+            Repository("Micro-CDR", micro_ros_mirror_prefix +"/Micro-CDR", "humble", "ros2"),
+            Repository("Micro-XRCE-DDS-Client", micro_ros_mirror_prefix +"/Micro-XRCE-DDS-Client", "humble", "ros2"),
+            Repository("rcl", micro_ros_mirror_prefix +"/rcl", "humble"),
+            Repository("rclc", micro_ros_mirror_prefix +"/rclc", "humble"),
+            Repository("micro_ros_utilities", micro_ros_mirror_prefix +"/micro_ros_utilities", "humble"),
+            Repository("rcutils", micro_ros_mirror_prefix +"/rcutils", "humble"),
+            Repository("micro_ros_msgs", micro_ros_mirror_prefix +"/micro_ros_msgs", "humble"),
+            Repository("rmw_microxrcedds", micro_ros_mirror_prefix +"/rmw_microxrcedds", "humble"),
+            Repository("rosidl_typesupport", micro_ros_mirror_prefix +"/rosidl_typesupport", "humble"),
+            Repository("rosidl_typesupport_microxrcedds", micro_ros_mirror_prefix +"/rosidl_typesupport_microxrcedds", "humble"),
+            Repository("rosidl", micro_ros_mirror_prefix +"/rosidl", "humble"),
+            Repository("rmw", micro_ros_mirror_prefix +"/rmw", "humble"),
+            Repository("rcl_interfaces", micro_ros_mirror_prefix +"/rcl_interfaces", "humble"),
+            Repository("rosidl_defaults", micro_ros_mirror_prefix +"/rosidl_defaults", "humble"),
+            Repository("unique_identifier_msgs", micro_ros_mirror_prefix +"/unique_identifier_msgs", "humble"),
+            Repository("common_interfaces", micro_ros_mirror_prefix +"/common_interfaces", "humble"),
+            Repository("test_interface_files", micro_ros_mirror_prefix +"/test_interface_files", "humble"),
+            Repository("rmw_implementation", micro_ros_mirror_prefix +"/rmw_implementation", "humble"),
+            Repository("rcl_logging", micro_ros_mirror_prefix +"/rcl_logging", "humble"),
+            Repository("ros2_tracing", micro_ros_mirror_prefix +"/ros2_tracing", "humble"),
         ],
-        'foxy': [
-            Repository("micro-CDR", "https://github.com/eProsima/micro-CDR", "foxy", "ros2"),
-            Repository("Micro-XRCE-DDS-Client", "https://github.com/eProsima/Micro-XRCE-DDS-Client", "foxy", "ros2"),
-            Repository("rcl", "https://github.com/micro-ROS/rcl", "foxy"),
-            Repository("rclc", "https://github.com/ros2/rclc", "foxy"),
-            Repository("rcutils", "https://github.com/micro-ROS/rcutils", "foxy"),
-            Repository("micro_ros_msgs", "https://github.com/micro-ROS/micro_ros_msgs", "foxy"),
-            Repository("rmw-microxrcedds", "https://github.com/micro-ROS/rmw-microxrcedds", "foxy"),
-            Repository("rosidl_typesupport", "https://github.com/micro-ROS/rosidl_typesupport", "foxy"),
-            Repository("rosidl_typesupport_microxrcedds", "https://github.com/micro-ROS/rosidl_typesupport_microxrcedds", "foxy"),
-            Repository("tinydir_vendor", "https://github.com/ros2/tinydir_vendor", "foxy", "master"),
-            Repository("rosidl", "https://github.com/ros2/rosidl", "foxy"),
-            Repository("rmw", "https://github.com/ros2/rmw", "foxy"),
-            Repository("rcl_interfaces", "https://github.com/ros2/rcl_interfaces", "foxy"),
-            Repository("rosidl_defaults", "https://github.com/ros2/rosidl_defaults", "foxy"),
-            Repository("unique_identifier_msgs", "https://github.com/ros2/unique_identifier_msgs", "foxy"),
-            Repository("common_interfaces", "https://github.com/ros2/common_interfaces", "foxy"),
-            Repository("test_interface_files", "https://github.com/ros2/test_interface_files", "foxy"),
-            Repository("rmw_implementation", "https://github.com/ros2/rmw_implementation", "foxy"),
-            Repository("rcl_logging", "https://github.com/ros2/rcl_logging", "foxy"),
+        'foxy': [   
+            Repository("Micro-CDR", micro_ros_mirror_prefix +"/Micro-CDR", "foxy", "ros2"),
+            Repository("Micro-XRCE-DDS-Client", "https://gitee.com/kurisaW/Micro-XRCE-DDS-Client", "foxy-bb"),
+            Repository("rcl", micro_ros_mirror_prefix +"/rcl", "foxy"),
+            Repository("rclc", micro_ros_mirror_prefix +"/rclc", "foxy"),
+            Repository("rcutils", micro_ros_mirror_prefix +"/rcutils", "foxy"),
+            Repository("micro_ros_msgs", micro_ros_mirror_prefix +"/micro_ros_msgs", "foxy"),
+            Repository("rmw_microxrcedds", micro_ros_mirror_prefix +"/rmw_microxrcedds", "foxy"),
+            Repository("rosidl_typesupport", micro_ros_mirror_prefix +"/rosidl_typesupport", "foxy"),
+            Repository("rosidl_typesupport_microxrcedds", micro_ros_mirror_prefix +"/rosidl_typesupport_microxrcedds", "foxy"),
+            Repository("tinydir_vendor", micro_ros_mirror_prefix +"/tinydir_vendor", "foxy", "master"),
+            Repository("rosidl", micro_ros_mirror_prefix +"/rosidl", "foxy"),
+            Repository("rmw", micro_ros_mirror_prefix +"/rmw", "foxy"),
+            Repository("rcl_interfaces", micro_ros_mirror_prefix +"/rcl_interfaces", "foxy"),
+            Repository("rosidl_defaults", micro_ros_mirror_prefix +"/rosidl_defaults", "foxy"),
+            Repository("unique_identifier_msgs", micro_ros_mirror_prefix +"/unique_identifier_msgs", "foxy"),
+            Repository("common_interfaces", micro_ros_mirror_prefix +"/common_interfaces", "foxy"),
+            Repository("test_interface_files", micro_ros_mirror_prefix +"/test_interface_files", "foxy"),
+            Repository("rmw_implementation", micro_ros_mirror_prefix +"/rmw_implementation", "foxy"),
+            Repository("rcl_logging", micro_ros_mirror_prefix +"/rcl_logging", "foxy"),
             Repository("ros2_tracing", "https://gitlab.com/micro-ROS/ros_tracing/ros2_tracing", "foxy", "foxy_microros"),
         ]
     }

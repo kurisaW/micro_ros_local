@@ -2,15 +2,17 @@ import rtconfig
 import os, sys
 import shutil
 import stat
+import subprocess
 from distutils.dir_util import copy_tree
 
 from .utils import run_cmd, rmtree
 from .repositories import Repository, Sources
+import pdb
 
 class Build:
     def __init__(self, library_folder, packages_folder, distro, env):
 
-        self.temp_folder = os.getenv('TEMP') + "\\micro"
+        self.temp_folder = os.path.join(os.getenv('TEMP', '/tmp'), "micro")
 
         self.library_folder = library_folder
         self.packages_folder = packages_folder
@@ -21,18 +23,18 @@ class Build:
         self.dev_packages = []
         self.mcu_packages = []
 
-        self.dev_folder = self.build_folder + '\\dev'
-        self.dev_src_folder = self.dev_folder + '\\src'
-        self.mcu_folder = self.build_folder + '\\mcu'
-        self.mcu_src_folder = self.mcu_folder + '\\src'
-        self.patch_folder = library_folder + '\\patchs\\' + self.distro
+        self.dev_folder = os.path.join(self.build_folder, 'dev')
+        self.dev_src_folder = os.path.join(self.dev_folder, 'src')
+        self.mcu_folder = os.path.join(self.build_folder, 'mcu')
+        self.mcu_src_folder = os.path.join(self.mcu_folder, 'src')
+        self.patch_folder = os.path.join(library_folder, 'patchs', self.distro)
 
-        self.library_path = library_folder + '\\libmicroros'
-        self.library = self.library_path + "\\libmicroros.a"
-        self.includes = self.library_path+ '\\include'
+        self.library_path = os.path.join(library_folder, 'libmicroros')
+        self.library = os.path.join(self.library_path, "libmicroros.a")
+        self.includes = os.path.join(self.library_path, 'include')
         self.library_name = "microros"
 
-    def run(self, toolchain, user_meta = ""):
+    def run(self, toolchain, user_meta=""):
         if os.path.exists(self.library_path):
             print("micro-ROS already built")
             return
@@ -42,36 +44,41 @@ class Build:
         os.makedirs(self.temp_folder)
 
         self.download_dev_environment()
-        self.apply_patchs(self.dev_src_folder)
+        self.apply_patches(self.dev_src_folder)
         self.build_dev_environment()
         self.download_mcu_environment()
         self.download_extra_packages()
-        self.apply_patchs(self.mcu_src_folder)
+        self.apply_patches(self.mcu_src_folder)
         self.build_mcu_environment(toolchain, user_meta)
         self.package_mcu_library()
 
         # Delete generated build folders
-        rmtree(self.temp_folder)
+        # Here we chose to keep the micro-ROS repository source files,too facilitate the debugging of project functions
+        # rmtree(self.temp_folder)
 
     def ignore_package(self, name):
         for p in self.mcu_packages:
             if p.name == name:
                 p.ignore()
 
-    def apply_patchs(self, target_folder):
+    def apply_patches(self, target_folder):
         for patch_file in [x for x in os.listdir(self.patch_folder) if x.endswith('patch')]:
             repository_name = patch_file.split('.')[0]
-            repository_path = target_folder + "\\" + repository_name
+            repository_path = os.path.normpath(os.path.join(target_folder, repository_name))
 
-            # Check if repository exist
-            if (os.path.isdir(repository_path)):
+            # Check if repository exists
+            if os.path.isdir(repository_path):
 
                 # Apply patch
-                patch_path = self.patch_folder + "\\" + patch_file
-                command = "git apply {} --verbose".format(patch_path)
+                patch_path = os.path.join(self.patch_folder, patch_file)
+
+                print(patch_path)
+                print(repository_path)
+
+                command =  'patch -p1 < {}'.format(patch_path) if os.name != 'nt' else 'git apply {} --verbose'.format(patch_path)
                 result, stderr = run_cmd(command, env=self.env, capture_output=True, cwd=repository_path)
 
-                if 0 != result:
+                if result != 0:
                     print("{} repository patch failed: \n{}".format(repository_name, stderr))
                     sys.exit(1)
 
@@ -86,10 +93,11 @@ class Build:
 
     def build_dev_environment(self):
         print("Building micro-ROS dev dependencies")
-        command = 'py -3 -m colcon build --packages-ignore-regex=.*_cpp --cmake-args -DBUILD_TESTING=OFF -G "Unix Makefiles"'.format()
+        python_cmd = 'python3' if os.name != 'nt' else 'py -3'
+        command = '{} -m colcon build --packages-ignore-regex=.*_cpp --cmake-args -DBUILD_TESTING=OFF -G "Unix Makefiles"'.format(python_cmd)
         result, stderr = run_cmd(command, env=self.env, cwd=self.dev_folder)
 
-        if 0 != result:
+        if result != 0:
             print("Build dev micro-ROS environment failed\n")
             sys.exit(1)
 
@@ -121,20 +129,23 @@ class Build:
 
         copy_tree(self.packages_folder, self.mcu_src_folder)
 
-    def build_mcu_environment(self, toolchain_file, user_meta = ""):
+    def build_mcu_environment(self, toolchain_file, user_meta=""):
         print("Building micro-ROS library")
-        common_meta_path = self.library_folder + '\\metas\\common.meta'
-        colcon_command = 'py -3 -m colcon build --merge-install --packages-ignore-regex=.*_cpp --metas {} {} --cmake-args -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=OFF -DTHIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release --toolchain={} -G "Unix Makefiles"'.format(common_meta_path, user_meta, toolchain_file)
-        command = "{}\\install\\setup.bat && {}".format(self.dev_folder, colcon_command)
+        common_meta_path = os.path.join(self.library_folder, 'metas', 'common.meta')
+        python_cmd = 'python3' if os.name != 'nt' else 'py -3'
+        colcon_command = '{} -m colcon build --merge-install --packages-ignore-regex=.*_cpp --metas {} {} --cmake-args -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=OFF -DTHIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE={} -G "Unix Makefiles"'.format(python_cmd, common_meta_path, user_meta, toolchain_file)
+        command = 'cmd /c "{}\\install\\setup.bat && {}"'.format(self.dev_folder, colcon_command) if os.name == 'nt' else "bash -c 'source {}/install/setup.bash; {}'".format(self.dev_folder, colcon_command)
+        os.chmod(self.dev_folder, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        print(command)
         result, stderr = run_cmd(command, env=self.env, cwd=self.mcu_folder)
 
-        if 0 != result:
+        if result != 0:
             print("Build mcu micro-ROS environment failed\n")
             sys.exit(1)
 
     def package_mcu_library(self):
-        aux_folder = self.build_folder + "\\temp"
-        aux_naming_folder = aux_folder + "\\naming"
+        aux_folder = os.path.join(self.build_folder, "temp")
+        aux_naming_folder = os.path.join(aux_folder, "naming")
 
         os.makedirs(aux_folder)
         os.makedirs(aux_naming_folder)
@@ -144,17 +155,20 @@ class Build:
         # Generate object files with namespace prefix
         obj_list = []
         os.chdir(aux_naming_folder)
-        for root, dirs, files in os.walk(self.mcu_folder + "\\install\\lib"):
+        for root, dirs, files in os.walk(os.path.join(self.mcu_folder, "install", "lib")):
             for f in files:
                 if f.endswith('.a'):
-                    os.system("{AR} x {PATH}".format(AR=AR, PATH=(root + "\\" + f)))
+                    os.system("{AR} x {PATH}".format(AR=AR, PATH=os.path.join(root, f)))
                     for obj in [x for x in os.listdir(aux_naming_folder) if x.endswith('obj')]:
                         updated_name = f.split('.')[0] + "__" + obj
-                        os.rename(obj, '..\\' + updated_name)
+                        os.rename(obj, os.path.join('..', updated_name))
                         obj_list.append(updated_name)
+                        print("updated_name:" + updated_name)
+        print("Save Micro-Ros static libraries to local")
 
         # Create linker script
         os.chdir(aux_folder)
+        # create a ar_script.m file to cover content:$(ar_script.write(content))
         with open("ar_script.m", "w+") as ar_script:
             ar_script.write("CREATE libmicroros.a\n")
 
@@ -168,22 +182,22 @@ class Build:
         command = "{} -M < ar_script.m".format(AR)
         result, stderr = run_cmd(command, env=self.env)
 
-        if 0 != result:
+        if result != 0:
             print("micro-ROS static library build failed\n")
             sys.exit(1)
 
-        os.rename('libmicroros.a', self.library)
+        shutil.copy(os.path.join(self.build_folder, "temp", "libmicroros.a"), self.library_path)
 
         # Copy includes
-        shutil.copytree(self.build_folder + "\\mcu\\install\\include", self.includes)
+        shutil.copytree(os.path.join(self.build_folder, "mcu", "install", "include"), self.includes)
 
         # Fix include paths
         if self.distro not in ["galactic", "foxy"]:
             include_folders = os.listdir(self.includes)
 
             for folder in include_folders:
-                folder_path = self.includes + "\\{}".format(folder)
-                repeated_path = folder_path + "\\{}".format(folder)
+                folder_path = os.path.join(self.includes, folder)
+                repeated_path = os.path.join(folder_path, folder)
 
                 if os.path.exists(repeated_path):
                     copy_tree(repeated_path, folder_path)
