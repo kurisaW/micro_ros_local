@@ -10,7 +10,7 @@ from .utils import run_cmd
 
 def get_country_code():
     try:
-        response = requests.get('https://ipinfo.io')
+        response = requests.get('https://ipinfo.io', timeout=5)
         data = response.json()
         return data['country']
     except Exception as e:
