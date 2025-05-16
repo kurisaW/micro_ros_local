@@ -2,3 +2,5 @@
 **/libmicroros/
 rtthread_toolchain.cmake
 user.meta
+examples/**/*.o
+src/*.o

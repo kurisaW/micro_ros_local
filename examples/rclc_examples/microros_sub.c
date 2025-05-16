@@ -32,7 +32,9 @@
 
 rcl_subscription_t subscriber;
 std_msgs__msg__String msg;
-char test_array[ARRAY_LEN];
+
+char remote_addr[20] = {0};
+char remote_port[10]= {0};
 
 void subscription_callback(const void * msgin)
 {
@@ -42,7 +44,6 @@ void subscription_callback(const void * msgin)
 
 static void microros_sub_string_thread_entry(void *parameter)
 {
-    memset(test_array,'z',ARRAY_LEN);
 
     rcl_allocator_t allocator = rcl_get_default_allocator();
     rclc_support_t support;
@@ -80,6 +81,23 @@ static void microros_sub_string_thread_entry(void *parameter)
     RCCHECK(rcl_node_fini(&node));
 }
 
+static void set_transports(char *addr, char *port)
+{
+    rt_strncpy(remote_addr, addr, rt_strlen(addr));
+    rt_strncpy(remote_port, port, rt_strlen(port));
+    remote_addr[rt_strlen(addr)] = '\0';
+    remote_port[rt_strlen(port)] = '\0';
+}
+static char *get_remote_addr()
+{
+    return remote_addr;
+}
+
+static int get_remote_port()
+{
+    return (uint32_t)atoi(remote_port);
+}
+
 static void microros_sub_string(int argc, char* argv[])
 {
 #if defined(PKG_MICRO_ROS_USE_SERIAL)
@@ -95,13 +113,14 @@ static void microros_sub_string(int argc, char* argv[])
             LOG_E("Please refer to the parameters correctly!");
             LOG_E("Or you should define the 'MICRO_ROS_UDP_IP' and 'MICRO_ROS_UDP_PORT' variables in the rtconfig.h file");
         }
-        set_microros_udp_transports(MICRO_ROS_UDP_IP, MICRO_ROS_UDP_PORT);
+        set_microros_udp_transports(MICRO_ROS_UDP_IP, (uint32_t)atoi(MICRO_ROS_UDP_PORT));
         LOG_I("The current proxy IP address is [%s] | Agent port is [%s].", MICRO_ROS_UDP_IP, MICRO_ROS_UDP_PORT);
      }
      else
      {
-        set_microros_udp_transports(argv[1], (atoi)(argv[2]));
-        LOG_I("The current proxy IP address is [%s] | Agent port is [%s].",argv[1], argv[2]);
+        set_transports(argv[1], argv[2]);
+        set_microros_udp_transports(get_remote_addr(), get_remote_port());
+        LOG_I("The current proxy IP address is [%s] | Agent port is [%s].",remote_addr, remote_port);
      }
 
 #elif defined(PKG_MICRO_ROS_USE_TCP)
@@ -123,7 +142,7 @@ static void microros_sub_string(int argc, char* argv[])
      }
 #endif
 
-    rt_thread_t thread = rt_thread_create("mr_substring", microros_sub_string_thread_entry, RT_NULL, 2048, 25, 10);
+    rt_thread_t thread = rt_thread_create("mr_substring", microros_sub_string_thread_entry, RT_NULL, 4096, 10, 10);
     if(thread != RT_NULL)
     {
         rt_thread_startup(thread);
