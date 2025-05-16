@@ -44,27 +44,26 @@ class EnvironmentHandler:
         self.modified_env = os.environ.copy()
 
     def find_and_set_python3(self):
-        path_sep = ";" if platform.system() == "Windows" else ":"
-        path = self.modified_env['PATH'].split(path_sep)
-        
-        # Use case-insensitive search for 'python3' in path
-        possible_python_path = [x for x in path if re.search(r'python3', x, re.IGNORECASE) and "Scripts" not in x]
-        print("possible_python_path:",possible_python_path)
-
-        if len(possible_python_path) >= 1:
-            python_script_path = [x for x in path if re.search(r'python3', x, re.IGNORECASE) and "Scripts" in x]
-            # Prepend paths to PATH variable
-            path.insert(0, possible_python_path[0])
-            if python_script_path:
-                path.insert(0, python_script_path[0])
-            self.set_environment_variable('PATH', path_sep.join(path))
-            
-            # Check that pip is installed
-            python_cmd = 'python3' if platform.system() != 'nt' else 'py -3'
-            run_cmd(f'{python_cmd} -m ensurepip', env=self.modified_env, capture_output=True)
-
-            return True
+        path = self.modified_env.get('PATH', ' ').split(os.pathsep)
+        if (os.name == 'nt'):
+            possible_python_path = [x for x in path if "Python3" in x and "Scripts" not in x]
+            print("possible_python_path:",possible_python_path)
+            if len(possible_python_path) >= 1:
+                python_script_path = [x for x in path if "Python3" in x and "Scripts" in x]
+                path.insert(0, possible_python_path[0])
+                if python_script_path:
+                    path.insert(0, python_script_path[0])
+                self.set_environment_variable('PATH', os.pathsep.join(path))
+                run_cmd('py -3 -m ensurepip', env=self.modified_env, capture_output=True)
+                return True
+            else:
+                return False
         else:
+            for child_path in path:
+                if 'bin' in child_path.lower() and \
+                    os.path.exists(os.path.join(child_path, 'python3')):
+                    run_cmd('python3 -m ensurepip', env=self.modified_env, capture_output=True)
+                    return True
             return False
 
     def install_python_dependencies(self, deps):
