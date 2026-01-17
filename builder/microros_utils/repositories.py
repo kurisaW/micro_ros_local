@@ -4,7 +4,6 @@ import json
 import xml.etree.ElementTree as xml_parser
 import time
 import requests
-import geoip2.database
 
 from .utils import run_cmd
 

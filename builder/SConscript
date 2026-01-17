@@ -46,7 +46,7 @@ if build_microros:
 
     # Install dependencies
     env_handler.install_python_dependencies([
-        "geoip2", "catkin-pkg", "lark-parser", "empy", "colcon-common-extensions", 
+        "catkin-pkg", "lark-parser", "empy", "colcon-common-extensions",
         "importlib-resources", "pyyaml", "pytz", "markupsafe==2.0.1"
     ])
 
@@ -145,14 +145,6 @@ if GetDepend('PKG_UCLIENT_PLATFORM_EXAMPLE'):
 
     src.append(os.path.join(MICRO_ROS_PKG_PATH, 'examples', 'uxr_examples', 'ShapesDemo', 'ShapeType.c'))
     src.append(os.path.join(MICRO_ROS_PKG_PATH, 'examples', 'uxr_examples', 'ShapesDemo', 'shapes_demo.c'))
-
-print("cpppath:", cpppath)
-print("LIBS:", LIBS)
-print("LIBPATH:", LIBPATH)
-
-# env.Append(CPPPATH = cpppath)
-# env.Append(LIBPATH = LIBPATH)
-# env.Append(LIBS = LIBS)
 
 group = group + DefineGroup('libmicroros', src, depend = ['PKG_USING_MICRO_ROS_RTTHREAD_PACKAGE'], CPPPATH = cpppath, LIBS = LIBS, LIBPATH = LIBPATH)
 Return('group')
