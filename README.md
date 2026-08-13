@@ -33,7 +33,9 @@ Supported boards are:
 - Ready to use RT-Thread environment.
 - Python 3.6 or higher installation in the system path.
 - Python 3 pip installation in the system path.
-- CMake 3.13 or higher installation in the system path.
+- CMake 3.13 or higher. On Windows, if CMake is not already available,
+  `scons --build_microros` installs the Python `cmake` package into the detected
+  Python environment.
 - Git installation in the system path.
 
 ## How to add to your project
@@ -65,7 +67,46 @@ Once the package has been enabled, the library can be build with the following c
 scons --build_microros
 ```
 
-After the library is compiled for first time the build process will be skipped, to trigger a rebuild and included the latest changes:
+Downloaded repositories are stored in a persistent Git cache. Cleaning or rebuilding the
+library reuses this cache and does not download repositories again. The default cache is
+`%LOCALAPPDATA%/micro_ros_rtthread` on Windows and
+`~/.cache/micro_ros_rtthread` on Linux.
+
+```bash
+# Refresh repositories that are already in the cache
+scons --build_microros --update_microros_sources
+
+# Require every repository to be available locally; never access the network
+scons --build_microros --microros_offline
+
+# Prefer GitHub and fall back to Gitee on download failure
+scons --build_microros --microros_git_mirror=github
+
+# Use a custom persistent cache directory
+scons --build_microros --microros_cache_dir=/path/to/cache
+
+# Explicitly remove the download cache
+scons --clean_microros_cache
+```
+
+The same settings can be supplied through `MICROROS_CACHE_DIR` and
+`MICROROS_GIT_MIRROR`. Supported Git mirror values are `gitee` and `github`.
+Before installing missing Python dependencies, the build performs a short,
+best-effort public-IP region check. When the IP is in China, pip uses the
+Tsinghua PyPI mirror (`https://pypi.tuna.tsinghua.edu.cn/simple`) by default.
+An existing `PIP_INDEX_URL` is always respected. Set `MICROROS_IP_COUNTRY`
+(for example, `CN` or `US`) to override the IP lookup in CI or restricted
+networks; if the lookup is unavailable, pip keeps its normal configuration.
+
+The micro-ROS CMake cross-build inherits the active RT-Thread SCons compiler,
+archiver, `CPPPATH`, `CPPDEFINES`, `CCFLAGS`, `CFLAGS` and `CXXFLAGS`. The
+generated CMake configuration is stored in the temporary build directory, so
+`builder/toolchain.cmake` does not contain BSP-specific include directories or
+toolchain paths.
+
+After the first build, the library is reused while the active SCons configuration,
+micro-ROS meta files and toolchain remain unchanged. A configuration mismatch triggers
+an automatic rebuild. To force a rebuild for source or package changes:
 
 ```bash
 # Clean library

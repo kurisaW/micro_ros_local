@@ -1,36 +1,81 @@
 from building import *
+import building
 import rtconfig
 import sys
 import os
-import platform
 
 cwd = GetCurrentDir()
 sys.path.append(cwd)
 group = []
 
-from microros_utils.library_builder import Build
-from microros_utils.library_builder import CMakeToolchain
-from microros_utils.utils import run_cmd, rmtree, EnvironmentHandler, MetaFileGenerator
+from microros_utils.utils import (
+    clean_microros_cache,
+    get_default_microros_cache_dir,
+    rmtree,
+    EnvironmentHandler,
+    MetaFileGenerator,
+    detect_china_ip,
+)
 
 
 ##############################
 #### SCons initialization ####
 ##############################
-env = Environment()
+
+if hasattr(building, 'GetCurrentEnv'):
+    env = building.GetCurrentEnv()
+else:
+    env = getattr(building, 'Env', None)
+
+if env is None:
+    raise RuntimeError("Unable to access the active RT-Thread SCons environment")
 
 AddOption('--build_microros', nargs=0, help='Enable micro-ROS build')
 AddOption('--clean_microros', nargs=0, help='Clean micro-ROS build')
+AddOption('--clean_microros_cache', nargs=0, help='Clean the persistent micro-ROS source cache')
+AddOption('--update_microros_sources', nargs=0, help='Update cached micro-ROS repositories')
+AddOption('--microros_offline', nargs=0, help='Build using cached micro-ROS repositories only')
+AddOption('--microros_git_mirror', nargs=1, help='Preferred Git mirror: gitee or github')
+AddOption('--microros_cache_dir', nargs=1, help='Persistent micro-ROS source cache directory')
 build_microros = env.GetOption("build_microros") is not None
 clean_microros = env.GetOption("clean_microros") is not None
+clean_microros_cache_requested = env.GetOption("clean_microros_cache") is not None
+update_microros_sources = env.GetOption("update_microros_sources") is not None
+microros_offline = env.GetOption("microros_offline") is not None
+preferred_mirror = env.GetOption("microros_git_mirror") or os.environ.get(
+    'MICROROS_GIT_MIRROR', 'gitee'
+)
+cache_folder = env.GetOption("microros_cache_dir") or get_default_microros_cache_dir()
+
+preferred_mirror = preferred_mirror.lower()
+if preferred_mirror not in ['gitee', 'github']:
+    print("Invalid micro-ROS Git mirror '{}'; use gitee or github".format(preferred_mirror))
+    sys.exit(1)
+
+if update_microros_sources and microros_offline:
+    print("--update_microros_sources and --microros_offline cannot be used together")
+    sys.exit(1)
 
 #################################
 #### Clean micro-ROS library ####
 #################################
 
-if clean_microros:
-    print("Cleaning micro-ROS for RT-Thread\n")
-    rmtree(os.path.join(cwd, 'libmicroros'))
-    sys.exit(1)
+if clean_microros or clean_microros_cache_requested:
+    if clean_microros:
+        print("Cleaning micro-ROS for RT-Thread\n")
+        rmtree(os.path.join(cwd, 'libmicroros'))
+
+    if clean_microros_cache_requested:
+        print("Cleaning persistent micro-ROS source cache: {}".format(cache_folder))
+        try:
+            if not clean_microros_cache(cache_folder):
+                print("micro-ROS source cache does not exist")
+        except RuntimeError as error:
+            print(error)
+            sys.exit(1)
+
+    if not build_microros:
+        sys.exit(0)
 
 #################################
 #### Build micro-ROS library ####
@@ -38,28 +83,81 @@ if clean_microros:
 
 if build_microros:
 
-    # Check python3 in PATH
-    env_handler = EnvironmentHandler()
-    if not env_handler.find_and_set_python3():
-        print("Please make sure that a Python 3 installation is available in PATH")
-        sys.exit(1)
+    from microros_utils.library_builder import Build
+    from microros_utils.scons_cmake import collect_scons_build_config
 
-    # Install dependencies
-    env_handler.install_python_dependencies([
-        "catkin-pkg", "lark-parser", "empy", "colcon-common-extensions",
-        "importlib-resources", "pyyaml", "pytz", "markupsafe==2.0.1"
-    ])
+    def build_microros_library():
+        try:
+            bsp_root = env.Dir('#').get_abspath()
+        except Exception:
+            bsp_root = os.getcwd()
 
-    print("Building micro-ROS for RT-Thread")
+        scons_build_config = collect_scons_build_config(
+            env,
+            base_dir=bsp_root,
+            system_processor=getattr(rtconfig, 'ARCH', 'aarch64'),
+            projects=getattr(building, 'Projects', []),
+        )
 
-    # Load micro-ROS build configuration
-    meta = MetaFileGenerator(os.path.join(cwd, 'user.meta'))
-    meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_NODES", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_NODES')))
-    meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_PUBLISHERS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_PUBLISHERS')))
-    meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_SUBSCRIPTIONS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_SUBSCRIBERS')))
-    meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_SERVICES", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_SERVICES')))
-    meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_CLIENTS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_CLIENTS')))
-    if GetDepend('RTT_UCLIENT_PLATFORM_RTTHREAD'):
+        include_paths = scons_build_config['include_paths']
+        required_headers = ['rtthread.h']
+        if (GetDepend('PKG_MICRO_ROS_USE_TCP')
+                or GetDepend('PKG_MICRO_ROS_USE_UDP')):
+            required_headers.append(os.path.join('sys', 'socket.h'))
+
+        missing_headers = [
+            header
+            for header in required_headers
+            if not any(
+                os.path.isfile(os.path.join(include_path, header))
+                for include_path in include_paths
+            )
+        ]
+        if missing_headers:
+            raise RuntimeError(
+                "RT-Thread SCons CPPPATH does not expose {}.\nCollected CPPPATH:\n  {}"
+                .format(', '.join(missing_headers), '\n  '.join(include_paths))
+            )
+
+        print("Collected {} RT-Thread include paths".format(len(include_paths)))
+
+        # Check python3 in PATH
+        env_handler = EnvironmentHandler()
+        for variable, value in env.get('ENV', {}).items():
+            env_handler.set_environment_variable(str(variable), str(value))
+        if not env_handler.find_and_set_python3():
+            print("Please make sure that a Python 3 installation is available in PATH")
+            sys.exit(1)
+
+        # Select a domestic PyPI source only for a detected China public IP.
+        # Git repository mirror selection remains controlled by its existing option.
+        env_handler.configure_download_mirrors(detect_china_ip())
+
+        # Install Python dependencies. On Windows the PyPI cmake wheel also
+        # provides cmake.exe, which colcon requires for its CMake packages.
+        python_dependencies = [
+            "catkin-pkg", "lark-parser", "empy", "colcon-common-extensions",
+            "importlib-resources", "pyyaml", "pytz", "markupsafe==2.0.1"
+        ]
+        if os.name == 'nt':
+            python_dependencies.append("cmake")
+        env_handler.install_python_dependencies(python_dependencies)
+        if os.name == 'nt' and not env_handler.ensure_cmake():
+            print(
+                "CMake 3.13 or newer is required. Install the Python 'cmake' "
+                "package or add cmake.exe to PATH."
+            )
+            sys.exit(1)
+
+        print("Building micro-ROS for RT-Thread")
+
+        # Load micro-ROS build configuration
+        meta = MetaFileGenerator(os.path.join(cwd, 'user.meta'))
+        meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_NODES", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_NODES')))
+        meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_PUBLISHERS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_PUBLISHERS')))
+        meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_SUBSCRIPTIONS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_SUBSCRIBERS')))
+        meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_SERVICES", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_SERVICES')))
+        meta.set_variable("rmw_microxrcedds", "RMW_UXRCE_MAX_CLIENTS", int(GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_MAX_CLIENTS')))
         if GetDepend('RTT_UCLIENT_PLATFORM_RTTHREAD'):
             meta.set_variable("microxrcedds_client", "UCLIENT_PLATFORM_RTTHREAD", "ON")
             if GetDepend('PKG_MICRO_ROS_USE_SERIAL'):
@@ -70,25 +168,34 @@ if build_microros:
                 meta.set_variable("microxrcedds_client", "UCLIENT_PROFILE_UDP", "ON")
                 meta.set_variable("microxrcedds_client", "UCLIENT_PROFILE_DISCOVERY", "ON")
 
-    # Check selected ROS2 distro
-    if GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_HUMBLE_DISTRO'):
-        distro = "humble"
-    elif GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_FOXY_DISTRO'):
-        distro = "foxy"
-    else:
-        print("Error, no valid ROS2 distribution selected")
-        sys.exit(1)
+        # Check selected ROS2 distro
+        if GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_HUMBLE_DISTRO'):
+            distro = "humble"
+        elif GetDepend('PKG_MICRO_ROS_RTTHREAD_PACKAGE_FOXY_DISTRO'):
+            distro = "foxy"
+        else:
+            print("Error, no valid ROS2 distribution selected")
+            sys.exit(1)
 
-    # Launch micro-ROS builder
-    modified_env = env_handler.get_env()
-    builder = Build(
-        library_folder=cwd, 
-        packages_folder=os.path.join(cwd, 'extra_packages'), 
-        distro=distro, 
-        env=modified_env
-    )
-    builder.run(os.path.join(cwd, "toolchain.cmake"), meta.path)
-    sys.exit(1)
+        # Launch micro-ROS builder
+        modified_env = env_handler.get_env()
+        builder = Build(
+            library_folder=cwd,
+            packages_folder=os.path.join(cwd, 'extra_packages'),
+            distro=distro,
+            env=modified_env,
+            cache_folder=cache_folder,
+            preferred_mirror=preferred_mirror,
+            update_sources=update_microros_sources,
+            offline=microros_offline,
+            scons_build_config=scons_build_config,
+        )
+        builder.run(os.path.join(cwd, "toolchain.cmake"), meta.path)
+        sys.exit(0)
+
+    if not hasattr(building, 'RegisterPreBuildingAction'):
+        raise RuntimeError("RT-Thread does not provide RegisterPreBuildingAction")
+    building.RegisterPreBuildingAction(build_microros_library)
 
 ################################
 #### Link micro-ROS library ####

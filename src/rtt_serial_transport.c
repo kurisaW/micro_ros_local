@@ -62,6 +62,7 @@ static int sem_initialized = 0;
 static struct rt_semaphore micro_ros_rx_sem;
 static rt_device_t micro_ros_serial;
 
+#if 0
 int clock_gettime(clockid_t unused, struct timespec *tp)
 {
     (void)unused;
@@ -72,6 +73,7 @@ int clock_gettime(clockid_t unused, struct timespec *tp)
 
     return 0;
 }
+#endif
 
 static rt_err_t uart_input(rt_device_t dev, rt_size_t size)
 {

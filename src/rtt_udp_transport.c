@@ -5,6 +5,7 @@
 #include "micro_ros_rtt.h"
 #include <stdio.h>
 #include <stdbool.h>
+#include <errno.h>
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -13,12 +14,13 @@
 #define DBG_LEVEL         DBG_LOG
 #include <rtdbg.h>
 
-static int sock;
+static int sock = -1;
 static struct hostent *host;
 static struct sockaddr_in server_addr;
 
 #define micro_rollover_useconds 4294967295
 
+#if 0
 int clock_gettime(clockid_t unused, struct timespec *tp)
 {
     (void)unused;
@@ -38,10 +40,17 @@ int clock_gettime(clockid_t unused, struct timespec *tp)
 
     return 0;
 }
+#endif
 
 bool micro_ros_udp_transport_open(struct uxrCustomTransport * transport)
 {
     struct micro_ros_agent_locator* locator = (struct micro_ros_agent_locator *) transport->args;
+
+    if (sock >= 0)
+    {
+        closesocket(sock);
+        sock = -1;
+    }
 
     if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
     {
@@ -51,7 +60,15 @@ bool micro_ros_udp_transport_open(struct uxrCustomTransport * transport)
     }
 
     host = (struct hostent *) gethostbyname( locator->address );
+    if (host == RT_NULL)
+    {
+        closesocket(sock);
+        sock = -1;
+        rt_kprintf("Unable to resolve micro-ROS agent: %s\n", locator->address);
+        return 0;
+    }
 
+    rt_memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(locator->port);
     server_addr.sin_addr = *((struct in_addr *)host->h_addr);
@@ -59,7 +76,9 @@ bool micro_ros_udp_transport_open(struct uxrCustomTransport * transport)
 
     if(connect(sock, (struct sockaddr *)&server_addr, sizeof(struct sockaddr)) < 0)
     {
-        rt_kprintf("Connect fail!\n", sock);
+        rt_kprintf("Connect fail!\n");
+        closesocket(sock);
+        sock = -1;
         return 0;
     }
      rt_kprintf("%d:Connect sucessful!\n", sock);
@@ -68,21 +87,60 @@ bool micro_ros_udp_transport_open(struct uxrCustomTransport * transport)
 
 bool micro_ros_udp_transport_close(struct uxrCustomTransport * transport)
 {
-    return closesocket(sock);;
+    int close_result;
+
+    (void)transport;
+
+    if (sock < 0)
+    {
+        return true;
+    }
+
+    close_result = closesocket(sock);
+    sock = -1;
+    return close_result == 0;
 }
 
 size_t micro_ros_udp_transport_write(struct uxrCustomTransport * transport, const uint8_t *buf, size_t len, uint8_t *errcode)
 {
     size_t rv = 0;
+    int transport_errno;
+
+    (void)transport;
+
+    if (sock < 0)
+    {
+        if (errcode != RT_NULL)
+        {
+            *errcode = 1;
+        }
+        rt_kprintf("micro-ROS UDP send failed: socket is closed, len=%u\n", (unsigned)len);
+        return 0;
+    }
+
     ssize_t bytes_sent = send(sock, (void*)buf, len, 0);
-    if (-1 != bytes_sent)
+    if ((bytes_sent >= 0) && ((size_t)bytes_sent == len))
     {
         rv = (size_t)bytes_sent;
-        *errcode = 0;
+        if (errcode != RT_NULL)
+        {
+            *errcode = 0;
+        }
     }
     else
     {
-        *errcode = 1;
+        transport_errno = rt_get_errno();
+        if (errcode != RT_NULL)
+        {
+            *errcode = 1;
+        }
+        rt_kprintf(
+            "micro-ROS UDP send failed: sock=%d, requested=%u, sent=%d, errno=%d (%s)\n",
+            sock,
+            (unsigned)len,
+            (int)bytes_sent,
+            transport_errno,
+            rt_strerror(transport_errno));
     }
     return rv;
 }
@@ -90,24 +148,67 @@ size_t micro_ros_udp_transport_write(struct uxrCustomTransport * transport, cons
 size_t micro_ros_udp_transport_read(struct uxrCustomTransport * transport, uint8_t *buf, size_t len, int timeout, uint8_t *errcode)
 {
     size_t rv = 0;
+    int transport_errno;
+
+    (void)transport;
+
+    if (sock < 0)
+    {
+        if (errcode != RT_NULL)
+        {
+            *errcode = 1;
+        }
+        return 0;
+    }
+
     timeout = (timeout <= 0) ? 1 : timeout;
     struct timeval tv;
     tv.tv_sec = timeout / 1000;
     tv.tv_usec = (timeout % 1000) * 1000;
     if (0 != setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)))
     {
-        *errcode = 1;
+        if (errcode != RT_NULL)
+        {
+            *errcode = 1;
+        }
         return 0;
     }
     ssize_t bytes_received = recv(sock, (void*)buf, len, 0);
     if (-1 != bytes_received)
     {
         rv = (size_t)bytes_received;
-        *errcode = 0;
+        if (errcode != RT_NULL)
+        {
+            *errcode = 0;
+        }
     }
     else
     {
-        *errcode = 1;
+        transport_errno = rt_get_errno();
+
+        /* A receive timeout is normal while the executor is polling. */
+        if ((transport_errno == EAGAIN) ||
+            (transport_errno == EWOULDBLOCK) ||
+            (transport_errno == ETIMEDOUT) ||
+            (transport_errno == EINTR))
+        {
+            if (errcode != RT_NULL)
+            {
+                *errcode = 0;
+            }
+            return 0;
+        }
+
+        if (errcode != RT_NULL)
+        {
+            *errcode = 1;
+        }
+        rt_kprintf(
+            "micro-ROS UDP receive failed: sock=%d, len=%u, errno=%d (%s)\n",
+            sock,
+            (unsigned)len,
+            transport_errno,
+            rt_strerror(transport_errno));
     }
 
     return rv;

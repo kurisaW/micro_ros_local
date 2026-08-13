@@ -5,7 +5,55 @@ import json
 import platform
 import re
 import shutil
+import shlex
 import subprocess
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+MICROROS_CACHE_MARKER = '.microros-cache'
+CHINA_PIP_INDEX_URL = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+
+
+def quote_python_command(command):
+    """Quote a Python executable for a shell command on the current platform."""
+    if os.name == 'nt':
+        return subprocess.list2cmdline([command])
+    return shlex.quote(command)
+
+
+def detect_china_ip(timeout=2):
+    """Return whether the public IP is in China, or ``None`` if unknown.
+
+    The lookup is deliberately best-effort: an unavailable geolocation service
+    must never prevent an offline build or force a particular download source.
+    ``MICROROS_IP_COUNTRY`` can be used by CI and restricted networks to avoid
+    the external lookup (for example, set it to ``CN`` or ``US``).
+    """
+    country_override = os.environ.get('MICROROS_IP_COUNTRY')
+    if country_override:
+        return country_override.strip().upper() in ('CN', 'CHINA')
+
+    endpoints = (
+        'https://ipapi.co/json/',
+        'https://ipinfo.io/json',
+    )
+    for endpoint in endpoints:
+        try:
+            request = Request(endpoint, headers={'User-Agent': 'micro-ros-rtthread'})
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode('utf-8'))
+            country = (
+                payload.get('country_code')
+                or payload.get('countryCode')
+                or payload.get('country')
+            )
+            if country:
+                return country.strip().upper() == 'CN'
+        except (HTTPError, URLError, OSError, ValueError, KeyError):
+            continue
+
+    print('Unable to determine public IP region; using default download sources')
+    return None
 
 def run_cmd(command, env=None, capture_output=False, cwd=None):
     if capture_output:
@@ -32,6 +80,41 @@ def rmtree(directory):
         os.chmod(directory, stat.S_IWUSR)
         os.rmdir(directory)
 
+def get_default_microros_cache_dir():
+    configured_path = os.environ.get('MICROROS_CACHE_DIR')
+    if configured_path:
+        return os.path.abspath(os.path.expanduser(configured_path))
+
+    if platform.system() == 'Windows':
+        cache_home = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    else:
+        cache_home = os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache')
+
+    return os.path.join(cache_home, 'micro_ros_rtthread')
+
+def ensure_microros_cache(cache_dir):
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    os.makedirs(cache_dir, exist_ok=True)
+    marker_path = os.path.join(cache_dir, MICROROS_CACHE_MARKER)
+    if not os.path.exists(marker_path):
+        with open(marker_path, 'w') as marker:
+            marker.write('micro-ROS RT-Thread download cache\n')
+    return cache_dir
+
+def clean_microros_cache(cache_dir):
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    if not os.path.exists(cache_dir):
+        return False
+
+    marker_path = os.path.join(cache_dir, MICROROS_CACHE_MARKER)
+    if not os.path.isfile(marker_path):
+        raise RuntimeError(
+            "Refusing to remove unrecognized micro-ROS cache directory: {}".format(cache_dir)
+        )
+
+    rmtree(cache_dir)
+    return True
+
 class EnvironmentHandler:
     def __init__(self):
         self.modified_env = os.environ.copy()
@@ -39,6 +122,39 @@ class EnvironmentHandler:
 
     def get_env(self):
         return self.modified_env
+
+    def configure_download_mirrors(self, china_network):
+        """Configure pip for China without overriding an explicit user setting."""
+        if china_network:
+            if not self.modified_env.get('PIP_INDEX_URL'):
+                self.set_environment_variable('PIP_INDEX_URL', CHINA_PIP_INDEX_URL)
+            print('China IP detected; using the Tsinghua PyPI mirror for dependencies')
+
+    def ensure_cmake(self, minimum_version='3.13'):
+        """Check that a usable CMake executable is available in the build env."""
+        cmake_path = shutil.which('cmake', path=self.modified_env.get('PATH'))
+        if not cmake_path:
+            return False
+
+        try:
+            result = subprocess.run(
+                [cmake_path, '--version'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=self.modified_env,
+            )
+            version_line = (result.stdout or '').splitlines()[0]
+            version = tuple(int(part) for part in re.findall(r'\d+', version_line)[:3])
+            required = tuple(int(part) for part in minimum_version.split('.'))
+            if result.returncode != 0 or version < required:
+                return False
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+            return False
+
+        self.set_environment_variable('MICROROS_CMAKE_EXECUTABLE', cmake_path)
+        print('Found CMake: {}'.format(cmake_path))
+        return True
 
     def set_environment_variable(self, variable, value):
         self.modified_env[variable] = value
@@ -87,7 +203,10 @@ class EnvironmentHandler:
 
                     # Check if version string contains "Python 3"
                     if 'Python 3.' in version_output or 'Python 3' in version_output:
-                        self.python_cmd = cmd
+                        # Keep the absolute path so child build steps use the same
+                        # interpreter as pip, even when the Windows `py` launcher
+                        # points at a different installation.
+                        self.python_cmd = found_path
                         python_path = found_path
                         python_dir = os.path.dirname(found_path)
                         print(f"Found Python 3: {python_path}")
@@ -112,7 +231,7 @@ class EnvironmentHandler:
             if possible_python_paths:
                 python_dir = possible_python_paths[0]
                 python_path = os.path.join(python_dir, 'python3' if platform.system() != "Windows" else 'python.exe')
-                self.python_cmd = 'python3' if platform.system() != "Windows" else 'python'
+                self.python_cmd = python_path
                 print(f"Found Python via PATH search: {python_dir}")
             else:
                 print("Python 3 not found in PATH")
@@ -152,10 +271,12 @@ class EnvironmentHandler:
 
         # Update the environment variable
         self.set_environment_variable('PATH', path_sep.join(current_path))
+        self.set_environment_variable('MICROROS_PYTHON_EXECUTABLE', python_path)
 
         # Ensure pip is installed
         try:
-            result = run_cmd(f'{self.python_cmd} -m ensurepip', env=self.modified_env, capture_output=True)
+            python_command = quote_python_command(self.python_cmd)
+            result = run_cmd(f'{python_command} -m ensurepip', env=self.modified_env, capture_output=True)
             # ignore ensurepip errors (pip might already be installed)
         except Exception as e:
             print(f"Note: ensurepip check completed (pip may already be installed)")
@@ -170,7 +291,8 @@ class EnvironmentHandler:
         # Install dependencies
         # Use detected Python command, or fall back to platform-specific defaults
         python_cmd = self.python_cmd if self.python_cmd else ('python3' if platform.system() != 'Windows' else 'python')
-        pip_command = run(f'{python_cmd} -m pip freeze', shell=True, env=self.modified_env, stdout=PIPE, stderr=PIPE, text=True)
+        python_command = quote_python_command(python_cmd)
+        pip_command = run(f'{python_command} -m pip freeze', shell=True, env=self.modified_env, stdout=PIPE, stderr=PIPE, text=True)
         stdout = pip_command.stdout
         pip_packages = [x.split("==")[0] for x in stdout.split('\n') if x]
         required_packages = deps
@@ -184,7 +306,7 @@ class EnvironmentHandler:
 
         for p in to_install:
             print(f'Installing {p} with pip at RT-Thread environment')
-            run_cmd(f'{python_cmd} -m pip install {p}', env=self.modified_env, capture_output=False)
+            run_cmd(f'{python_command} -m pip install {p}', env=self.modified_env, capture_output=False)
 
 class MetaFileGenerator:
     def __init__(self, path):
@@ -201,3 +323,4 @@ class MetaFileGenerator:
     def save(self):
         with open(self.path, "w") as file:
             file.write(json.dumps(self.meta, indent=4))
+

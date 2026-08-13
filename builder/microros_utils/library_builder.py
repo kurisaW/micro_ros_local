@@ -1,24 +1,55 @@
 import rtconfig
 import os, sys
+import hashlib
+import json
 import shutil
 import stat
-import subprocess
+import tempfile
 from distutils.dir_util import copy_tree
 
-from .utils import run_cmd, rmtree
-from .repositories import Repository, Sources
-import pdb
+from .utils import quote_python_command, run_cmd, rmtree
+from .repositories import RepositoryError, Sources
+from .scons_cmake import write_scons_cmake_config
+
+
+STATIC_ROSIDL_TYPESUPPORT_C = 'rosidl_typesupport_microxrcedds_c'
+STATIC_RMW_IMPLEMENTATION = 'rmw_microxrcedds'
+
 
 class Build:
-    def __init__(self, library_folder, packages_folder, distro, env):
+    def __init__(
+        self,
+        library_folder,
+        packages_folder,
+        distro,
+        env,
+        cache_folder,
+        preferred_mirror='gitee',
+        update_sources=False,
+        offline=False,
+        scons_build_config=None,
+    ):
 
-        self.temp_folder = os.path.join(os.getenv('TEMP', '/tmp'), "micro")
+        project_id = hashlib.sha256(
+            os.path.realpath(library_folder).encode('utf-8')
+        ).hexdigest()[:12]
+        self.temp_folder = os.path.join(
+            tempfile.gettempdir(), 'micro_ros_build', project_id, distro
+        )
 
         self.library_folder = library_folder
         self.packages_folder = packages_folder
         self.build_folder = self.temp_folder
         self.distro = distro
         self.env = env
+        self.cache_folder = os.path.abspath(os.path.expanduser(cache_folder))
+        self.preferred_mirror = preferred_mirror
+        self.update_sources = update_sources
+        self.offline = offline
+        self.scons_build_config = scons_build_config
+        self.scons_cmake_config = os.path.join(
+            self.temp_folder, 'rtt_scons_build.cmake'
+        )
 
         self.dev_packages = []
         self.mcu_packages = []
@@ -32,29 +63,77 @@ class Build:
         self.library_path = os.path.join(library_folder, 'libmicroros')
         self.library = os.path.join(self.library_path, "libmicroros.a")
         self.includes = os.path.join(self.library_path, 'include')
+        self.build_config_stamp = os.path.join(self.library_path, '.build-config.sha256')
         self.library_name = "microros"
 
     def run(self, toolchain, user_meta=""):
-        if os.path.exists(self.library_path):
+        build_config_digest = self._build_config_digest(toolchain, user_meta)
+        existing_digest = None
+        if os.path.isfile(self.build_config_stamp):
+            with open(self.build_config_stamp, 'r') as stamp_file:
+                existing_digest = stamp_file.read().strip()
+
+        library_ready = (
+            os.path.isfile(self.library)
+            and os.path.isdir(self.includes)
+            and existing_digest == build_config_digest
+        )
+        if library_ready and not self.update_sources:
             print("micro-ROS already built")
             return
+
+        if os.path.exists(self.library_path):
+            print("Removing incomplete or configuration-mismatched micro-ROS library")
+            rmtree(self.library_path)
 
         # Delete previous build folders
         rmtree(self.temp_folder)
         os.makedirs(self.temp_folder)
 
-        self.download_dev_environment()
-        self.apply_patches(self.dev_src_folder)
-        self.build_dev_environment()
-        self.download_mcu_environment()
-        self.download_extra_packages()
-        self.apply_patches(self.mcu_src_folder)
-        self.build_mcu_environment(toolchain, user_meta)
-        self.package_mcu_library()
+        if self.scons_build_config is None:
+            raise RuntimeError("RT-Thread SCons build configuration was not provided")
+        write_scons_cmake_config(self.scons_build_config, self.scons_cmake_config)
+        print("Generated RT-Thread CMake configuration: {}".format(self.scons_cmake_config))
+
+        try:
+            self.download_dev_environment()
+            self.apply_patches(self.dev_src_folder)
+            self.build_dev_environment()
+            self.download_mcu_environment()
+            self.download_extra_packages()
+            self.apply_patches(self.mcu_src_folder)
+            self.build_mcu_environment(toolchain, user_meta)
+            self.package_mcu_library()
+            with open(self.build_config_stamp, 'w') as stamp_file:
+                stamp_file.write(build_config_digest + '\n')
+        except RepositoryError as error:
+            print("micro-ROS source download failed: {}".format(error))
+            sys.exit(1)
 
         # Delete generated build folders
         # Here we chose to keep the micro-ROS repository source files,too facilitate the debugging of project functions
         # rmtree(self.temp_folder)
+
+    def _build_config_digest(self, toolchain, user_meta):
+        digest = hashlib.sha256()
+        digest.update(self.distro.encode('utf-8'))
+        digest.update(STATIC_ROSIDL_TYPESUPPORT_C.encode('utf-8'))
+        digest.update(STATIC_RMW_IMPLEMENTATION.encode('utf-8'))
+        digest.update(
+            json.dumps(
+                self.scons_build_config,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+        )
+
+        common_meta = os.path.join(self.library_folder, 'metas', 'common.meta')
+        for config_file in [toolchain, common_meta, user_meta]:
+            if config_file and os.path.isfile(config_file):
+                with open(config_file, 'rb') as input_file:
+                    digest.update(input_file.read())
+
+        return digest.hexdigest()
 
     def ignore_package(self, name):
         for p in self.mcu_packages:
@@ -86,14 +165,20 @@ class Build:
 
     def download_dev_environment(self):
         print("Downloading micro-ROS dev dependencies")
-        for repo in Sources.dev_environments[self.distro]:
-            repo.clone(self.dev_src_folder)
-            print("\t - Downloaded {}".format(repo.name))
+        for repo in Sources.dev_environment(self.distro, self.preferred_mirror):
+            commit = repo.checkout(
+                self.dev_src_folder,
+                self.cache_folder,
+                env=self.env,
+                update=self.update_sources,
+                offline=self.offline,
+            )
+            print("\t - Ready {} @ {}".format(repo.name, commit[:12]))
             self.dev_packages.extend(repo.get_packages())
 
     def build_dev_environment(self):
         print("Building micro-ROS dev dependencies")
-        python_cmd = 'python3' if os.name != 'nt' else 'py -3'
+        python_cmd = self._python_command()
         command = '{} -m colcon build --packages-ignore-regex=.*_cpp --cmake-args -DBUILD_TESTING=OFF -G "Unix Makefiles"'.format(python_cmd)
         result, stderr = run_cmd(command, env=self.env, cwd=self.dev_folder)
 
@@ -103,14 +188,27 @@ class Build:
 
     def download_mcu_environment(self):
         print("Downloading micro-ROS library")
-        for repo in Sources.mcu_environments[self.distro]:
-            repo.clone(self.mcu_src_folder)
-            self.mcu_packages.extend(repo.get_packages())
-            for package in repo.get_packages():
+        for repo in Sources.mcu_environment(self.distro, self.preferred_mirror):
+            commit = repo.checkout(
+                self.mcu_src_folder,
+                self.cache_folder,
+                env=self.env,
+                update=self.update_sources,
+                offline=self.offline,
+            )
+            packages = repo.get_packages()
+            self.mcu_packages.extend(packages)
+            for package in packages:
                 if package.name in Sources.ignore_packages[self.distro] or package.name.endswith("_cpp"):
                     package.ignore()
 
-                print('\t - Downloaded {}{}'.format(package.name, " (ignored)" if package.ignored else ""))
+                print(
+                    '\t - Ready {} @ {}{}'.format(
+                        package.name,
+                        commit[:12],
+                        " (ignored)" if package.ignored else "",
+                    )
+                )
 
     def download_extra_packages(self):
         if not os.path.exists(self.packages_folder):
@@ -132,16 +230,29 @@ class Build:
     def build_mcu_environment(self, toolchain_file, user_meta=""):
         print("Building micro-ROS library")
         common_meta_path = os.path.join(self.library_folder, 'metas', 'common.meta')
-        python_cmd = 'python3' if os.name != 'nt' else 'py -3'
-        colcon_command = '{} -m colcon build --merge-install --packages-ignore-regex=.*_cpp --metas {} {} --cmake-args -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=OFF -DTHIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE={} -G "Unix Makefiles"'.format(python_cmd, common_meta_path, user_meta, toolchain_file)
+        python_cmd = self._python_command()
+        toolchain_file = os.path.abspath(toolchain_file).replace('\\', '/')
+        scons_cmake_config = os.path.abspath(self.scons_cmake_config).replace('\\', '/')
+        colcon_command = '{} -m colcon build --merge-install --packages-ignore-regex=.*_cpp --metas {} {} --cmake-args -DCMAKE_INSTALL_LIBDIR=lib -DCMAKE_POSITION_INDEPENDENT_CODE:BOOL=OFF -DTHIRDPARTY=ON -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release -DRTT_SCONS_CONFIG_FILE={} -DCMAKE_TOOLCHAIN_FILE={} -G "Unix Makefiles"'.format(python_cmd, common_meta_path, user_meta, scons_cmake_config, toolchain_file)
         command = 'cmd /c "{}\\install\\setup.bat && {}"'.format(self.dev_folder, colcon_command) if os.name == 'nt' else "bash -c 'source {}/install/setup.bash; {}'".format(self.dev_folder, colcon_command)
         os.chmod(self.dev_folder, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
         print(command)
-        result, stderr = run_cmd(command, env=self.env, cwd=self.mcu_folder)
+        build_env = self.env.copy()
+        build_env['RTT_SCONS_CONFIG_FILE'] = scons_cmake_config
+        build_env['STATIC_ROSIDL_TYPESUPPORT_C'] = STATIC_ROSIDL_TYPESUPPORT_C
+        build_env['RMW_IMPLEMENTATION'] = STATIC_RMW_IMPLEMENTATION
+        result, stderr = run_cmd(command, env=build_env, cwd=self.mcu_folder)
 
         if result != 0:
             print("Build mcu micro-ROS environment failed\n")
             sys.exit(1)
+
+    def _python_command(self):
+        """Return the interpreter selected during the environment check."""
+        python_executable = self.env.get('MICROROS_PYTHON_EXECUTABLE')
+        if not python_executable:
+            python_executable = 'python3' if os.name != 'nt' else 'python'
+        return quote_python_command(python_executable)
 
     def package_mcu_library(self):
         aux_folder = os.path.join(self.build_folder, "temp")
@@ -203,30 +314,3 @@ class Build:
                     copy_tree(repeated_path, folder_path)
                     rmtree(repeated_path)
 
-
-class CMakeToolchain:
-    def __init__(self, path, cc, cxx, ar, cflags, cxxflags):
-        common_flags = " -DCLOCK_MONOTONIC=0 -DCLOCK_REALTIME=1 -D'__attribute__(x)='"
-        cmake_toolchain = """
-include(CMakeForceCompiler)
-set(CMAKE_SYSTEM_NAME Generic)
-
-set(CMAKE_CROSSCOMPILING 1)
-set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-SET (CMAKE_C_COMPILER_WORKS 1)
-SET (CMAKE_CXX_COMPILER_WORKS 1)
-
-set(CMAKE_C_COMPILER {C_COMPILER})
-set(CMAKE_CXX_COMPILER {CXX_COMPILER})
-set(CMAKE_AR {AR_COMPILER})
-
-set(CMAKE_C_FLAGS_INIT " {C_FLAGS} {COMMON_FLAGS}" CACHE STRING "" FORCE)
-set(CMAKE_CXX_FLAGS_INIT " {CXX_FLAGS} {COMMON_FLAGS} -fno-rtti" CACHE STRING "" FORCE)
-set(__BIG_ENDIAN__ 0)"""
-
-        cmake_toolchain = cmake_toolchain.format(C_COMPILER=cc, CXX_COMPILER=cxx, AR_COMPILER=ar, C_FLAGS=cflags, CXX_FLAGS=cxxflags, COMMON_FLAGS=common_flags)
-
-        with open(path, "w") as file:
-            file.write(cmake_toolchain)
-
-        self.path = os.path.realpath(file.name)

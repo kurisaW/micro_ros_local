@@ -1,20 +1,106 @@
-import os
-import sys
+import collections
 import json
-import xml.etree.ElementTree as xml_parser
+import os
+import random
+import subprocess
+import sys
+import threading
 import time
-import requests
+import xml.etree.ElementTree as xml_parser
+from contextlib import contextmanager
 
-from .utils import run_cmd
+from .utils import ensure_microros_cache, rmtree
 
-def get_country_code():
+
+GIT_COMMAND_TIMEOUT = 15 * 60
+GIT_LOW_SPEED_LIMIT = 1024
+GIT_LOW_SPEED_TIME = 30
+MAX_FETCH_ATTEMPTS = 5
+LOCK_TIMEOUT = 10 * 60
+
+
+class RepositoryError(RuntimeError):
+    pass
+
+
+def run_git(arguments, env=None, timeout=GIT_COMMAND_TIMEOUT, stream=False):
+    command = ['git'] + list(arguments)
+
+    if not stream:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            return -1, stdout, "Git command timed out after {} seconds\n{}".format(timeout, stderr)
+        return process.returncode, stdout, stderr
+
+    output_tail = collections.deque(maxlen=80)
+    process = subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        bufsize=1,
+    )
+
+    def forward_output():
+        for line in iter(process.stdout.readline, ''):
+            output_tail.append(line)
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+    output_thread = threading.Thread(target=forward_output)
+    output_thread.daemon = True
+    output_thread.start()
+
     try:
-        response = requests.get('https://ipinfo.io')
-        data = response.json()
-        return data['country']
-    except Exception as e:
-        print(f"Error fetching IP info: {e}")
-        return None
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        output_tail.append("Git command timed out after {} seconds\n".format(timeout))
+        return_code = -1
+    finally:
+        output_thread.join(timeout=5)
+
+    return return_code, '', ''.join(output_tail)
+
+
+@contextmanager
+def repository_lock(cache_path, timeout=LOCK_TIMEOUT):
+    lock_path = cache_path + '.lock'
+    deadline = time.time() + timeout
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+
+    while True:
+        try:
+            os.mkdir(lock_path)
+            break
+        except FileExistsError:
+            if time.time() >= deadline:
+                raise RepositoryError(
+                    "Timed out waiting for repository cache lock: {}. "
+                    "If no other build is running, remove this lock directory.".format(lock_path)
+                )
+            time.sleep(1)
+
+    try:
+        yield
+    finally:
+        try:
+            os.rmdir(lock_path)
+        except OSError:
+            pass
+
 
 class Package:
     def __init__(self, name, path):
@@ -24,60 +110,174 @@ class Package:
 
     def ignore(self):
         self.ignored = True
-        ignore_path = self.path + '/COLCON_IGNORE'
+        ignore_path = os.path.join(self.path, 'COLCON_IGNORE')
         with open(ignore_path, 'a'):
             os.utime(ignore_path, None)
 
+
 class Repository:
-    def __init__(self, name, url, distribution, branch=None):
+    def __init__(self, name, urls, distribution, branch=None):
         self.name = name
-        self.url = url
+        self.urls = [urls] if isinstance(urls, str) else list(urls)
         self.distribution = distribution
         self.branch = distribution if branch is None else branch
         self.path = None
+        self.commit = None
 
-    def clone(self, folder):
+        if not self.urls:
+            raise ValueError("Repository {} has no download URL".format(name))
+
+    def checkout(self, folder, cache_root, env=None, update=False, offline=False):
         self.path = os.path.join(folder, self.name)
-        attempts = 0
-        # Download reconnect time, 1s by default
-        retry_delay = 1
-        # The number of repository redownloads that fail is defined here
-        max_attempts = 10
+        cache_path = os.path.join(cache_root, 'git', self.distribution, self.name + '.git')
+        ensure_microros_cache(cache_root)
 
-        command = "git clone -b {} {} {}".format(self.branch, self.url, self.path)
-        result, stderr = run_cmd(command, capture_output=True)
+        with repository_lock(cache_path):
+            self._ensure_bare_cache(cache_path, env)
+            cached_commit = self._get_cached_commit(cache_path, env)
 
-        if result == 0:
-            # Download successfully, exit the loop
-            return
-        else:
-            while attempts < max_attempts:
-                attempts += 1
-                print("{} clone failed! Retrying...".format(self.name))
-                command = "git clone -b {} {} {}".format(self.branch, self.url, self.path)
-                result, stderr = run_cmd(command, capture_output=True)
-                # Wait a while and try again
-                time.sleep(retry_delay)
+            if cached_commit is None:
+                if offline:
+                    raise RepositoryError(
+                        "{} is not available in the local cache and offline mode is enabled".format(self.name)
+                    )
+                commit = self._fetch_with_retry(cache_path, env)
+            elif update and not offline:
+                try:
+                    commit = self._fetch_with_retry(cache_path, env)
+                except RepositoryError as error:
+                    print("Warning: {}. Using cached {} @ {}".format(error, self.name, cached_commit[:12]))
+                    commit = cached_commit
+            else:
+                commit = cached_commit
 
-            # If all attempts fail, print an error message and exit the script
-            print("Max attempts reached. Failed to clone {} after {} attempts.".format(self.name, max_attempts))
-            sys.exit(1)
+            self._create_worktree(cache_path, self.path, commit, env)
+            self.commit = commit
+
+        return commit
+
+    def _cache_ref(self):
+        return 'refs/microros/' + self.branch
+
+    def _git(self, arguments, env=None, stream=False, check=True):
+        result, stdout, stderr = run_git(arguments, env=env, stream=stream)
+        if check and result != 0:
+            message = stderr.strip() or stdout.strip() or 'unknown Git error'
+            raise RepositoryError(message)
+        return result, stdout.strip(), stderr.strip()
+
+    def _ensure_bare_cache(self, cache_path, env):
+        if os.path.exists(cache_path):
+            result, stdout, _ = self._git(
+                ['--git-dir', cache_path, 'rev-parse', '--is-bare-repository'],
+                env=env,
+                check=False,
+            )
+            if result == 0 and stdout == 'true':
+                return
+
+            print("Removing invalid repository cache: {}".format(cache_path))
+            if os.path.isdir(cache_path):
+                rmtree(cache_path)
+            else:
+                os.remove(cache_path)
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        self._git(['init', '--bare', cache_path], env=env)
+
+    def _get_cached_commit(self, cache_path, env):
+        result, stdout, _ = self._git(
+            ['--git-dir', cache_path, 'rev-parse', '--verify', self._cache_ref() + '^{commit}'],
+            env=env,
+            check=False,
+        )
+        return stdout if result == 0 else None
+
+    def _fetch_once(self, cache_path, url, env):
+        refspec = '+refs/heads/{0}:{1}'.format(self.branch, self._cache_ref())
+        arguments = [
+            '-c', 'http.lowSpeedLimit={}'.format(GIT_LOW_SPEED_LIMIT),
+            '-c', 'http.lowSpeedTime={}'.format(GIT_LOW_SPEED_TIME),
+            '--git-dir', cache_path,
+            'fetch', '--force', '--prune', '--depth=1', '--no-tags',
+            url, refspec,
+        ]
+        result, _, stderr = self._git(arguments, env=env, stream=True, check=False)
+        if result != 0:
+            raise RepositoryError(stderr or 'git fetch failed')
+
+        commit = self._get_cached_commit(cache_path, env)
+        if commit is None:
+            raise RepositoryError("Fetched {} but could not resolve {}".format(self.name, self._cache_ref()))
+        return commit
+
+    def _fetch_with_retry(self, cache_path, env):
+        last_error = None
+
+        for attempt in range(MAX_FETCH_ATTEMPTS):
+            url_index = (attempt // 2) % len(self.urls)
+            url = self.urls[url_index]
+            print(
+                "Fetching {} ({}/{}) from {}".format(
+                    self.name, attempt + 1, MAX_FETCH_ATTEMPTS, url
+                )
+            )
+            try:
+                commit = self._fetch_once(cache_path, url, env)
+                print("\t - Cached {} @ {}".format(self.name, commit[:12]))
+                return commit
+            except RepositoryError as error:
+                last_error = error
+                print("\t - Fetch failed: {}".format(error))
+
+            if attempt + 1 < MAX_FETCH_ATTEMPTS:
+                delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 0.5)
+                print("\t - Retrying in {:.1f} seconds".format(delay))
+                time.sleep(delay)
+
+        raise RepositoryError(
+            "Failed to fetch {} branch {} after {} attempts: {}".format(
+                self.name, self.branch, MAX_FETCH_ATTEMPTS, last_error
+            )
+        )
+
+    def _create_worktree(self, cache_path, worktree_path, commit, env):
+        self._git(['--git-dir', cache_path, 'worktree', 'prune'], env=env)
+
+        if os.path.exists(worktree_path):
+            self._git(
+                ['--git-dir', cache_path, 'worktree', 'remove', '--force', worktree_path],
+                env=env,
+                check=False,
+            )
+            if os.path.isdir(worktree_path):
+                rmtree(worktree_path)
+            elif os.path.exists(worktree_path):
+                os.remove(worktree_path)
+            self._git(['--git-dir', cache_path, 'worktree', 'prune'], env=env)
+
+        os.makedirs(os.path.dirname(worktree_path), exist_ok=True)
+        self._git(
+            ['--git-dir', cache_path, 'worktree', 'add', '--force', '--detach', worktree_path, commit],
+            env=env,
+        )
 
     def get_packages(self):
         packages = []
-        if os.path.exists(self.path + '/package.xml'):
+        if os.path.exists(os.path.join(self.path, 'package.xml')):
             packages.append(Package(self.name, self.path))
         else:
             for root, dirs, files in os.walk(self.path):
-                path = root.split(os.sep)
                 if 'package.xml' in files:
-                    package_name = Repository.get_package_name_from_package_xml(os.path.join(root, 'package.xml'))
-                    package_path = os.path.join(os.getcwd(), root)
-                    packages.append(Package(package_name, package_path))
+                    package_name = Repository.get_package_name_from_package_xml(
+                        os.path.join(root, 'package.xml')
+                    )
+                    packages.append(Package(package_name, os.path.abspath(root)))
                 elif 'colcon.pkg' in files:
-                    package_name = Repository.get_package_name_from_colcon_pkg(os.path.join(root, 'colcon.pkg'))
-                    package_path = os.path.join(os.getcwd(), root)
-                    packages.append(Package(package_name, package_path))
+                    package_name = Repository.get_package_name_from_colcon_pkg(
+                        os.path.join(root, 'colcon.pkg')
+                    )
+                    packages.append(Package(package_name, os.path.abspath(root)))
         return packages
 
     @classmethod
@@ -90,89 +290,109 @@ class Repository:
 
     @classmethod
     def get_package_name_from_colcon_pkg(cls, colcon_pkg):
-        with open(colcon_pkg, 'r') as f:
-            content = json.load(f)
-            if content['name']:
-                return content['name']
-            return None
+        with open(colcon_pkg, 'r') as file:
+            content = json.load(file)
+            return content.get('name')
+
 
 class Sources:
-    country_code = get_country_code()
+    GITEE_PREFIX = 'https://gitee.com/rtt-microros-mirror'
+    GITHUB_PREFIX = 'https://github.com/RT-MicroROS'
 
-    if country_code == 'CN':
-        micro_ros_mirror_prefix = "https://gitee.com/rtt-microros-mirror"
-        print("=========================== Use Chinese mirror source for download ==============================")
-    else:
-        micro_ros_mirror_prefix = "https://github.com/RT-MicroROS"
-        print("=========================== Download using the Github source ==============================")
+    DEV_REPOSITORIES = [
+        'ament_cmake',
+        'ament_lint',
+        'ament_package',
+        'googletest',
+        'ament_cmake_ros',
+        'ament_index',
+    ]
 
-    dev_environments = {
-         'humble': [
-            Repository("ament_cmake", micro_ros_mirror_prefix + "/ament_cmake", "humble"),
-            Repository("ament_lint", micro_ros_mirror_prefix + "/ament_lint", "humble"),
-            Repository("ament_package", micro_ros_mirror_prefix + "/ament_package", "humble"),
-            Repository("googletest", micro_ros_mirror_prefix + "/googletest", "humble"),
-            Repository("ament_cmake_ros", micro_ros_mirror_prefix +"/ament_cmake_ros", "humble"),
-            Repository("ament_index", micro_ros_mirror_prefix + "/ament_index", "humble")
+    MCU_REPOSITORIES = {
+        'humble': [
+            ('Micro-CDR', 'ros2'),
+            ('Micro-XRCE-DDS-Client', 'ros2'),
+            ('rcl', None),
+            ('rclc', None),
+            ('micro_ros_utilities', None),
+            ('rcutils', None),
+            ('micro_ros_msgs', None),
+            ('rmw_microxrcedds', None),
+            ('rosidl_typesupport', None),
+            ('rosidl_typesupport_microxrcedds', None),
+            ('rosidl', None),
+            ('rmw', None),
+            ('rcl_interfaces', None),
+            ('rosidl_defaults', None),
+            ('unique_identifier_msgs', None),
+            ('common_interfaces', None),
+            ('test_interface_files', None),
+            ('rmw_implementation', None),
+            ('rcl_logging', None),
+            ('ros2_tracing', None),
         ],
         'foxy': [
-            Repository("ament_cmake", micro_ros_mirror_prefix + "/ament_cmake", "foxy"),
-            Repository("ament_lint", micro_ros_mirror_prefix + "/ament_lint", "foxy"),
-            Repository("ament_package", micro_ros_mirror_prefix + "/ament_package", "foxy"),
-            Repository("googletest", micro_ros_mirror_prefix + "/googletest", "foxy"),
-            Repository("ament_cmake_ros", micro_ros_mirror_prefix +"/ament_cmake_ros", "foxy"),
-            Repository("ament_index", micro_ros_mirror_prefix + "/ament_index", "foxy")
-        ]
-    }
-
-    mcu_environments = {
-        'humble': [
-            Repository("Micro-CDR", micro_ros_mirror_prefix +"/Micro-CDR", "humble", "ros2"),
-            Repository("Micro-XRCE-DDS-Client", micro_ros_mirror_prefix +"/Micro-XRCE-DDS-Client", "humble", "ros2"),
-            Repository("rcl", micro_ros_mirror_prefix +"/rcl", "humble"),
-            Repository("rclc", micro_ros_mirror_prefix +"/rclc", "humble"),
-            Repository("micro_ros_utilities", micro_ros_mirror_prefix +"/micro_ros_utilities", "humble"),
-            Repository("rcutils", micro_ros_mirror_prefix +"/rcutils", "humble"),
-            Repository("micro_ros_msgs", micro_ros_mirror_prefix +"/micro_ros_msgs", "humble"),
-            Repository("rmw_microxrcedds", micro_ros_mirror_prefix +"/rmw_microxrcedds", "humble"),
-            Repository("rosidl_typesupport", micro_ros_mirror_prefix +"/rosidl_typesupport", "humble"),
-            Repository("rosidl_typesupport_microxrcedds", micro_ros_mirror_prefix +"/rosidl_typesupport_microxrcedds", "humble"),
-            Repository("rosidl", micro_ros_mirror_prefix +"/rosidl", "humble"),
-            Repository("rmw", micro_ros_mirror_prefix +"/rmw", "humble"),
-            Repository("rcl_interfaces", micro_ros_mirror_prefix +"/rcl_interfaces", "humble"),
-            Repository("rosidl_defaults", micro_ros_mirror_prefix +"/rosidl_defaults", "humble"),
-            Repository("unique_identifier_msgs", micro_ros_mirror_prefix +"/unique_identifier_msgs", "humble"),
-            Repository("common_interfaces", micro_ros_mirror_prefix +"/common_interfaces", "humble"),
-            Repository("test_interface_files", micro_ros_mirror_prefix +"/test_interface_files", "humble"),
-            Repository("rmw_implementation", micro_ros_mirror_prefix +"/rmw_implementation", "humble"),
-            Repository("rcl_logging", micro_ros_mirror_prefix +"/rcl_logging", "humble"),
-            Repository("ros2_tracing", micro_ros_mirror_prefix +"/ros2_tracing", "humble"),
+            ('Micro-CDR', 'ros2'),
+            ('Micro-XRCE-DDS-Client', 'foxy-bb'),
+            ('rcl', None),
+            ('rclc', None),
+            ('rcutils', None),
+            ('micro_ros_msgs', None),
+            ('rmw_microxrcedds', None),
+            ('rosidl_typesupport', None),
+            ('rosidl_typesupport_microxrcedds', None),
+            ('tinydir_vendor', 'master'),
+            ('rosidl', None),
+            ('rmw', None),
+            ('rcl_interfaces', None),
+            ('rosidl_defaults', None),
+            ('unique_identifier_msgs', None),
+            ('common_interfaces', None),
+            ('test_interface_files', None),
+            ('rmw_implementation', None),
+            ('rcl_logging', None),
+            ('ros2_tracing', 'foxy_microros'),
         ],
-        'foxy': [   
-            Repository("Micro-CDR", micro_ros_mirror_prefix +"/Micro-CDR", "foxy", "ros2"),
-            Repository("Micro-XRCE-DDS-Client", "https://gitee.com/kurisaW/Micro-XRCE-DDS-Client", "foxy-bb"),
-            Repository("rcl", micro_ros_mirror_prefix +"/rcl", "foxy"),
-            Repository("rclc", micro_ros_mirror_prefix +"/rclc", "foxy"),
-            Repository("rcutils", micro_ros_mirror_prefix +"/rcutils", "foxy"),
-            Repository("micro_ros_msgs", micro_ros_mirror_prefix +"/micro_ros_msgs", "foxy"),
-            Repository("rmw_microxrcedds", micro_ros_mirror_prefix +"/rmw_microxrcedds", "foxy"),
-            Repository("rosidl_typesupport", micro_ros_mirror_prefix +"/rosidl_typesupport", "foxy"),
-            Repository("rosidl_typesupport_microxrcedds", micro_ros_mirror_prefix +"/rosidl_typesupport_microxrcedds", "foxy"),
-            Repository("tinydir_vendor", micro_ros_mirror_prefix +"/tinydir_vendor", "foxy", "master"),
-            Repository("rosidl", micro_ros_mirror_prefix +"/rosidl", "foxy"),
-            Repository("rmw", micro_ros_mirror_prefix +"/rmw", "foxy"),
-            Repository("rcl_interfaces", micro_ros_mirror_prefix +"/rcl_interfaces", "foxy"),
-            Repository("rosidl_defaults", micro_ros_mirror_prefix +"/rosidl_defaults", "foxy"),
-            Repository("unique_identifier_msgs", micro_ros_mirror_prefix +"/unique_identifier_msgs", "foxy"),
-            Repository("common_interfaces", micro_ros_mirror_prefix +"/common_interfaces", "foxy"),
-            Repository("test_interface_files", micro_ros_mirror_prefix +"/test_interface_files", "foxy"),
-            Repository("rmw_implementation", micro_ros_mirror_prefix +"/rmw_implementation", "foxy"),
-            Repository("rcl_logging", micro_ros_mirror_prefix +"/rcl_logging", "foxy"),
-            Repository("ros2_tracing", "https://gitlab.com/micro-ROS/ros_tracing/ros2_tracing", "foxy", "foxy_microros"),
-        ]
     }
 
     ignore_packages = {
         'humble': ['rcl_logging_log4cxx', 'rcl_logging_spdlog', 'rcl_yaml_param_parser', 'rclc_examples'],
-        'foxy': ['rosidl_typesupport_introspection_c', 'rosidl_typesupport_introspection_cpp', 'rcl_logging_log4cxx', 'rcl_logging_spdlog', 'rcl_yaml_param_parser', 'rclc_examples']
+        'foxy': [
+            'rosidl_typesupport_introspection_c',
+            'rosidl_typesupport_introspection_cpp',
+            'rcl_logging_log4cxx',
+            'rcl_logging_spdlog',
+            'rcl_yaml_param_parser',
+            'rclc_examples',
+        ],
     }
+
+    @classmethod
+    def _mirror_urls(cls, name, preferred_mirror):
+        urls = {
+            'gitee': cls.GITEE_PREFIX + '/' + name,
+            'github': cls.GITHUB_PREFIX + '/' + name,
+        }
+        secondary = 'github' if preferred_mirror == 'gitee' else 'gitee'
+        return [urls[preferred_mirror], urls[secondary]]
+
+    @classmethod
+    def dev_environment(cls, distro, preferred_mirror):
+        return [
+            Repository(name, cls._mirror_urls(name, preferred_mirror), distro)
+            for name in cls.DEV_REPOSITORIES
+        ]
+
+    @classmethod
+    def mcu_environment(cls, distro, preferred_mirror):
+        repositories = []
+        for name, branch in cls.MCU_REPOSITORIES[distro]:
+            if distro == 'foxy' and name == 'Micro-XRCE-DDS-Client':
+                urls = ['https://gitee.com/kurisaW/Micro-XRCE-DDS-Client']
+            elif distro == 'foxy' and name == 'ros2_tracing':
+                urls = ['https://gitlab.com/micro-ROS/ros_tracing/ros2_tracing']
+            else:
+                urls = cls._mirror_urls(name, preferred_mirror)
+            repositories.append(Repository(name, urls, distro, branch))
+        return repositories
+

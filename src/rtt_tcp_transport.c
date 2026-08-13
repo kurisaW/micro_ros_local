@@ -19,6 +19,7 @@ static struct sockaddr_in server_addr;
 
 #define micro_rollover_useconds 4294967295
 
+#if 0
 int clock_gettime(clockid_t unused, struct timespec *tp)
 {
     (void)unused;
@@ -36,6 +37,7 @@ int clock_gettime(clockid_t unused, struct timespec *tp)
 
     return 0;
 }
+#endif
 
 bool micro_ros_tcp_transport_open(struct uxrCustomTransport * transport)
 {
